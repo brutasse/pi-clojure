@@ -1,6 +1,7 @@
 /**
  * Clojure delimiter repair: a scanner that localizes delimiter errors, a repair
- * step that is accepted only when it stays next to the error, and optional
+ * step that is accepted only while it is surgical - next to the error, or, for
+ * missing closers, a pure closer insertion inside the form - and optional
  * `cljfmt` formatting that may only move whitespace.
  *
  * Delimiter repair runs in-process through the `parinfer` npm package
@@ -17,9 +18,12 @@
  * thing: measured on a real codebase, one missing closer made it move
  * delimiters on up to 33 lines, up to 1190 lines away from the error, and the
  * result stayed balanced, so nothing downstream could spot it. `repairSurgically`
- * therefore accepts the engine's proposal only when it rewrote a couple of lines
- * next to the error the scanner found; a wider rewrite is declined and the caller
- * keeps the author's own text.
+ * therefore checks the engine's proposal against the errors the scanner found:
+ * when the only errors are unclosed openers, the proposal must add nothing but
+ * the missing closers, each inside the form it closes - the closer sits any
+ * distance below the opener, so no distance band applies there; any other error
+ * keeps the band, a couple of lines next to the error. A wider or misplaced
+ * proposal is declined and the caller keeps the author's own text.
  *
  * `cljfmt` is trusted only as a whitespace tool: an output that is empty or that
  * changes any non-whitespace character is discarded. It exits 0 with no output at
@@ -204,6 +208,21 @@ export function describeScanErrors(errors: ScanError[]): string {
     .join("; ");
 }
 
+/**
+ * Appended to a declined repair whose only errors are unclosed openers: the
+ * opener line is where the form starts, but the missing closer is where it
+ * ends - pointing at the opener is how a session gets lost balancing
+ * delimiters.
+ */
+function unclosedCloserHint(errors: ScanError[]): string {
+  if (errors.length === 1) {
+    return `the missing closer belongs at the end of the form opened on line ${errors[0].line}, not on that line - look where the indentation returns to the form's level`;
+  }
+  return `the missing closers belong at the ends of the forms opened on line(s) ${errors
+    .map((e) => e.line)
+    .join(", ")}, not on those lines - look where the indentation returns to each form's level`;
+}
+
 // ============================================================================
 // Lines a rewrite touched (whitespace-insensitive, so reindent is not a change)
 // ============================================================================
@@ -269,18 +288,22 @@ export function repairText(text: string): RepairResult {
 }
 
 // ============================================================================
-// The repair guard: a proposal is accepted only next to the error
+// The repair guard: a proposal is accepted only next to the error, or, for
+// missing closers, only as a pure closer insertion
 // ============================================================================
 
-/** A repair may rewrite at most this many lines. */
+/** A repair may rewrite at most this many lines (a pure closer insertion, the
+ *  guard for repairs that only fix unclosed openers, adds and so is exempt). */
 export const MAX_REPAIR_CHANGED_LINES = 2;
 /** ... may only touch this far above an error ... */
 export const REPAIR_WINDOW_BEFORE = 5;
 /**
- * ... and this far below one. The band is asymmetric on purpose: a missing
- * closer is reported at the opener and inserted at the end of that form, which
- * is often tens of lines lower, while the damage pattern - closing a form early
- * where the indentation suggests it ends - always reaches above the error.
+ * ... and this far below one. The band is asymmetric on purpose: the damage
+ * pattern - closing a form early where the indentation suggests it ends -
+ * always reaches above the error, while below it is where a missing closer
+ * belongs. Repairs whose only errors are unclosed openers do not use the band
+ * at all: the closer may sit any distance below the opener, so they are
+ * checked as pure closer insertions instead (see `repairSurgically`).
  */
 export const REPAIR_WINDOW_AFTER = 30;
 
@@ -302,6 +325,9 @@ export interface SurgicalRepairOptions {
    * changed). A repair near these is as acceptable as one near the error.
    */
   anchors?: number[];
+  // The three limits below bound the distance band, which repairs whose only
+  // errors are unclosed openers do not use (those are judged as pure closer
+  // insertions; see `repairSurgically`).
   maxChangedLines?: number;
   windowBefore?: number;
   windowAfter?: number;
@@ -309,13 +335,20 @@ export interface SurgicalRepairOptions {
 
 /**
  * Repair `text` only as far as the change can be justified by the error the
- * scanner found. Beyond `MAX_REPAIR_CHANGED_LINES` lines, or outside
+ * scanner found. When the only errors are unclosed openers, the guard is
+ * structural rather than a distance band: a missing closer is added where the
+ * form ends, any distance below the opener (a 45-line deftest cannot be
+ * repaired within 30 lines of its opener), so the proposal must be a pure
+ * insertion of the missing closers - nothing moved or deleted - with each
+ * closer inside the form it closes. For any other error the band applies:
+ * beyond `MAX_REPAIR_CHANGED_LINES` lines, or outside
  * `REPAIR_WINDOW_BEFORE`/`REPAIR_WINDOW_AFTER` of an error (or of `anchors`),
  * the proposal is declined: a repair that wide is indistinguishable from the
- * engine "fixing" indentation that was merely unusual, and it silently relocates
- * real delimiters. Measured on a real codebase with one closer removed per file,
- * the accepted repairs restored the original delimiters exactly in 90 of 108
- * cases and never moved a delimiter the author had not misplaced.
+ * engine "fixing" indentation that was merely unusual, and it silently
+ * relocates real delimiters. (The band's measured record: on a real codebase
+ * with one closer removed per file, the accepted repairs restored the
+ * original delimiters exactly in 90 of 108 cases and never moved a delimiter
+ * the author had not misplaced.)
  */
 export async function repairSurgically(
   text: string,
@@ -328,13 +361,11 @@ export async function repairSurgically(
   if (outcome.status === "error") return outcome;
   if (outcome.status === "unfixable") return outcome;
 
-  const maxChanged = opts.maxChangedLines ?? MAX_REPAIR_CHANGED_LINES;
-  const windowBefore = opts.windowBefore ?? REPAIR_WINDOW_BEFORE;
-  const windowAfter = opts.windowAfter ?? REPAIR_WINDOW_AFTER;
   const rewrote = changedLinesBetween(text, outcome.text);
+  const allUnclosed = errors.every((e) => e.kind === "unclosed");
   const decline = (why: string): SurgicalRepair => ({
     status: "declined",
-    message: `${describeScanErrors(errors)}; ${why}`,
+    message: `${describeScanErrors(errors)}; ${why}${allUnclosed ? `; ${unclosedCloserHint(errors)}` : ""}`,
     errors,
     rewrote,
   });
@@ -346,6 +377,11 @@ export async function repairSurgically(
     return decline("the repair would still leave delimiter errors");
   }
 
+  if (allUnclosed) return guardCloserInsertion(decline, text, outcome.text, errors, rewrote);
+
+  const maxChanged = opts.maxChangedLines ?? MAX_REPAIR_CHANGED_LINES;
+  const windowBefore = opts.windowBefore ?? REPAIR_WINDOW_BEFORE;
+  const windowAfter = opts.windowAfter ?? REPAIR_WINDOW_AFTER;
   const anchors = [...errors.map((e) => e.line), ...(opts.anchors ?? [])];
   if (rewrote.length > maxChanged) {
     return decline(
@@ -361,6 +397,98 @@ export async function repairSurgically(
     );
   }
   return { status: "repaired", text: outcome.text, rewrote };
+}
+
+/**
+ * The 1-based lines of `repaired` on which a closing delimiter was inserted,
+ * when `repaired` is `text` with nothing but closing delimiters and
+ * whitespace added; null when any existing character was moved, deleted, or
+ * replaced. A missing closer is exactly such an addition - the closer the
+ * reader never saw, appended where the form ends - so a repair that is not a
+ * pure insertion is one that relocated real delimiters.
+ */
+function insertedClosingLines(text: string, repaired: string): number[] | null {
+  if (repaired.length < text.length) return null; // a pure insertion only grows the text
+  let i = 0; // walk of text
+  let j = 0; // walk of repaired
+  let line = 1;
+  const inserted = new Set<number>();
+  while (j < repaired.length) {
+    const c = repaired[j];
+    if (i < text.length && c === text[i]) {
+      if (c === "\n") line++;
+      i++;
+      j++;
+      continue;
+    }
+    if (c === "\n" || c === " " || c === "\t") {
+      if (c === "\n") line++;
+      j++;
+      continue;
+    }
+    if (c === ")" || c === "]" || c === "}") {
+      inserted.add(line);
+      j++;
+      continue;
+    }
+    return null; // not in text here, and not a closer or whitespace
+  }
+  if (i < text.length) return null; // text ran out: something was deleted
+  return [...inserted];
+}
+
+/** The leading-whitespace width of 1-based line `n` of `lines`. */
+function indentOf(lines: string[], n: number): number {
+  const t = lines[n - 1] ?? "";
+  return t.length - t.trimStart().length;
+}
+
+/**
+ * The first line after `fromLine` that starts at the same or lesser
+ * indentation and carries content - the next top-level construct the form
+ * opened on `fromLine` cannot swallow; `lines.length + 1` (EOF) when the form
+ * runs to the end of the file.
+ */
+function formEndLine(lines: string[], fromLine: number, indent: number): number {
+  for (let idx = fromLine; idx < lines.length; idx++) {
+    const t = lines[idx];
+    if (t.trim() === "") continue;
+    if (t.length - t.trimStart().length <= indent) return idx + 1;
+  }
+  return lines.length + 1;
+}
+
+/**
+ * The guard for a repair whose only errors are unclosed openers. A missing
+ * closer sits any distance below its opener, at the end of the form it opens,
+ * so no distance band applies; instead the proposal must be a pure insertion
+ * of the missing closers, and every closer must land inside one of the
+ * unclosed forms: on or after its opener, and not past the next line that
+ * starts at the form's own indentation - a closer past that line would nest
+ * the following top-level forms inside the one it closes.
+ */
+function guardCloserInsertion(
+  decline: (why: string) => SurgicalRepair,
+  text: string,
+  repaired: string,
+  errors: ScanError[],
+  rewrote: number[],
+): SurgicalRepair {
+  const inserted = insertedClosingLines(text, repaired);
+  if (inserted === null) {
+    return decline(
+      "the repair moves or deletes existing delimiters - a missing closer is added where the form ends, it is never moved",
+    );
+  }
+  const lines = text.split("\n");
+  const spans = errors.map((e) => ({ from: e.line, to: formEndLine(lines, e.line, indentOf(lines, e.line)) }));
+  const outside = inserted.filter((line) => !spans.some((s) => line >= s.from && line <= s.to));
+  if (outside.length > 0) {
+    return decline(
+      `the repair would insert the closer on line(s) ${lineList(outside)}, outside the unclosed forms - the forms that follow would end up nested inside them`,
+    );
+  }
+  return { status: "repaired", text: repaired, rewrote };
 }
 
 // ============================================================================

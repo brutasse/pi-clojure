@@ -237,15 +237,15 @@ test("edit: repaired file gets written back and a change note with the content",
   const id = nextID();
   await h.toolCall("edit", id, { path: "a.clj", edits: [{ oldText: "1", newText: "1 (oops" }] });
   writeFileSync(file, "(def a 1 (oops\n", "utf8"); // simulate the applied edit
-  mockRepair({ "(def a 1 (oops\n": { status: "repaired", text: "(def a 1)\n" } });
+  mockRepair({ "(def a 1 (oops\n": { status: "repaired", text: "(def a 1 (oops))\n" } });
   mockFormat();
   const result = await h.toolResult("edit", id, { path: "a.clj" }, "Successfully replaced 1 block(s) in a.clj.");
-  assert.equal(readFileSync(file, "utf8"), "(def a 1)\n");
+  assert.equal(readFileSync(file, "utf8"), "(def a 1 (oops))\n");
   const text = resultText(result?.content);
   assert.match(text, /Auto-repair note:/);
   assert.match(text, /repaired automatically/);
   assert.match(text, /Current on-disk content:/);
-  assert.match(text, /1: \(def a 1\)/);
+  assert.match(text, /1: \(def a 1 \(oops\)\)/);
 });
 
 test("edit: cljfmt-only change still gets written back and noticed", async () => {
@@ -313,7 +313,7 @@ test("edit: a repair that would move unrelated delimiters restores the file", as
   assert.equal(result.isError, true);
   assert.match(resultText(result?.content), /was reverted/);
   assert.match(resultText(result?.content), /opened at line 5 is never closed/);
-  assert.match(resultText(result?.content), /rewrite 4 lines \(1, 2, 3, 7\)/);
+  assert.match(resultText(result?.content), /moves or deletes existing delimiters/);
 });
 
 test("edit: the same missing closer in a well-indented file is repaired", async () => {
